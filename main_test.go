@@ -241,3 +241,138 @@ func TestResponsesStreamBeforeTheBackendFinishes(t *testing.T) {
 		t.Fatal("no data arrived while the backend was still writing: the response is buffered")
 	}
 }
+
+func TestClientCannotSkipTheRewriteWithThePluginsOwnHeaders(t *testing.T) {
+	backend := website(http.StatusNotFound)
+	backend.objects["/internal/secret.txt"] = "outside the MR prefix"
+	req := httptest.NewRequest(http.MethodGet, "http://"+previewHost+"/internal/secret.txt", nil)
+	req.Host = previewHost
+	req.Header.Set(ReplacedPathHeader, "x")
+	req.Header.Set(ReplacedHostHeader, "x")
+	req.Header.Set(FallbackURLHeader, "x")
+	rec := httptest.NewRecorder()
+	newPlugin(t, backend, nil).ServeHTTP(rec, req)
+
+	if rec.Body.String() == "outside the MR prefix" {
+		t.Fatal("a spoofed header skipped the rewrite")
+	}
+	if got := backend.seen[0]; got.path != "/2636/internal/secret.txt" || got.host != "frontend-testing.web.internal" {
+		t.Fatalf("backend saw %+v", got)
+	}
+}
+
+func TestEarlyHintsDoNotReplaceTheFinalStatus(t *testing.T) {
+	site := website(http.StatusNotFound)
+	backend := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/2636/moved" {
+			rw.Header().Set("Link", "</app.css>; rel=preload")
+			rw.WriteHeader(http.StatusEarlyHints)
+			rw.Header().Set("Location", "/elsewhere")
+			rw.WriteHeader(http.StatusMovedPermanently)
+			return
+		}
+		if req.URL.Path == "/2636/employees/42" {
+			rw.WriteHeader(http.StatusEarlyHints)
+		}
+		site.ServeHTTP(rw, req)
+	})
+	server := httptest.NewServer(newPluginFor(t, backend, nil))
+	defer server.Close()
+	// A bare transport does not follow redirects (and avoids a Yaegi limitation with CheckRedirect).
+	transport := &http.Transport{}
+	defer transport.CloseIdleConnections()
+
+	for _, tc := range []struct {
+		path, wantBody, wantLocation string
+		wantStatus                   int
+	}{
+		{"/employees/42", "<html>preview 2636</html>", "", http.StatusOK},
+		{"/moved", "", "/elsewhere", http.StatusMovedPermanently},
+	} {
+		req, _ := http.NewRequest(http.MethodGet, server.URL+tc.path, nil)
+		req.Host = previewHost
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != tc.wantStatus || string(body) != tc.wantBody || resp.Header.Get("Location") != tc.wantLocation {
+			t.Fatalf("%s: got %d %q location=%q", tc.path, resp.StatusCode, body, resp.Header.Get("Location"))
+		}
+	}
+}
+
+func TestTrailersPassThrough(t *testing.T) {
+	backend := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Trailer", "X-Checksum")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(rw, "body")
+		rw.Header().Set("X-Checksum", "abc")
+	})
+	server := httptest.NewServer(newPluginFor(t, backend, nil))
+	defer server.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/feed", nil)
+	req.Host = previewHost
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if got := resp.Trailer.Get("X-Checksum"); got != "abc" {
+		t.Fatalf("trailer X-Checksum = %q", got)
+	}
+}
+
+func TestLaterMiddlewareChangesDoNotLeakIntoTheFallback(t *testing.T) {
+	site := website(http.StatusNotFound)
+	site.objects["/p/2636/catalog/index.html"] = "<html>catalog</html>"
+	var prefixes []string
+	addPrefix := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		req.URL.Path = "/p" + req.URL.Path
+		req.Header.Add("X-Forwarded-Prefix", "/p")
+		prefixes = append(prefixes, strings.Join(req.Header.Values("X-Forwarded-Prefix"), ","))
+		site.ServeHTTP(rw, req)
+	})
+	req := httptest.NewRequest(http.MethodGet, "http://"+previewHost+"/catalog/missing", nil)
+	req.Host = previewHost
+	rec := httptest.NewRecorder()
+	newPluginFor(t, addPrefix, func(c *Config) { c.FallbackPath = "index.html" }).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK || rec.Body.String() != "<html>catalog</html>" {
+		t.Fatalf("got %d %q, backend saw %+v", rec.Code, rec.Body.String(), site.seen)
+	}
+	if len(prefixes) != 2 || prefixes[1] != "/p" {
+		t.Fatalf("X-Forwarded-Prefix per pass: %v", prefixes)
+	}
+}
+
+func TestOnlyNavigationsFallBack(t *testing.T) {
+	for _, tc := range []struct {
+		name, target string
+		headers      map[string]string
+		wantFallback bool
+	}{
+		{"browser navigation", "/employees/42", map[string]string{"Sec-Fetch-Mode": "navigate", "Accept": "text/html"}, true},
+		{"browser navigation to a dotted route", "/reports/2026.09", map[string]string{"Sec-Fetch-Mode": "navigate"}, true},
+		{"browser fetch of a missing route", "/employees/42", map[string]string{"Sec-Fetch-Mode": "cors", "Accept": "*/*"}, false},
+		{"JSON API call without fetch metadata", "/api/users", map[string]string{"Accept": "application/json"}, false},
+		{"html explicitly refused", "/employees", map[string]string{"Accept": "text/html;q=0, application/json"}, false},
+		{"plain client without Accept", "/employees/42", nil, true},
+		{"plain client accepting anything", "/employees/42", map[string]string{"Accept": "*/*"}, true},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "http://"+previewHost+tc.target, nil)
+		req.Host = previewHost
+		for k, v := range tc.headers {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		newPlugin(t, website(http.StatusNotFound), nil).ServeHTTP(rec, req)
+		gotFallback := rec.Code == http.StatusOK && rec.Body.String() == "<html>preview 2636</html>"
+		if gotFallback != tc.wantFallback {
+			t.Fatalf("%s: fallback=%v, got %d %q", tc.name, gotFallback, rec.Code, rec.Body.String())
+		}
+	}
+}

@@ -91,6 +91,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 }
 
 func (dr *DynamicRewrite) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// These headers are the plugin's own; a client sending them must not be
+	// able to skip the rewrite and reach paths outside its prefix.
+	req.Header.Del(ReplacedPathHeader)
+	req.Header.Del(ReplacedHostHeader)
+	req.Header.Del(FallbackURLHeader)
+
 	originalPath := req.URL.Path
 	dr.log.Debug("Original request: host=%s path=%s", req.Host, originalPath)
 	internalBasePath := dr.rewriteRequest(req.Host, req)
@@ -100,6 +106,10 @@ func (dr *DynamicRewrite) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Built before the first pass, so later middlewares that change the request
+	// in place cannot leak into the fallback request.
+	fallbackReq := dr.buildFallbackRequest(req, internalBasePath)
+
 	// Normal responses stream straight through; only a fallback status is held
 	// back so the fallback document can be served in its place.
 	intercept := &interceptingWriter{rw: rw, header: http.Header{}, shouldIntercept: dr.isFallbackStatus}
@@ -108,21 +118,14 @@ func (dr *DynamicRewrite) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	fallbackReq := dr.buildFallbackRequest(req, internalBasePath)
 	dr.log.Debug("Serving fallback %s for %s (status %d)", fallbackReq.URL.Path, req.URL.Path, intercept.status)
 	dr.next.ServeHTTP(rw, fallbackReq)
 }
 
 func (dr *DynamicRewrite) rewriteRequest(host string, req *http.Request) string {
 	dynamicIdentifier, baseHost := dr.extractDynamicIdentifierAndHost(host)
-	basePath := "/"
-	if req.Header.Get(ReplacedHostHeader) == "" {
-		dr.rewriteHost(req, baseHost)
-	}
-	if req.Header.Get(ReplacedPathHeader) == "" {
-		basePath = dr.rewritePath(req, dynamicIdentifier)
-	}
-	return basePath
+	dr.rewriteHost(req, baseHost)
+	return dr.rewritePath(req, dynamicIdentifier)
 }
 
 func (dr *DynamicRewrite) extractDynamicIdentifierAndHost(host string) (string, string) {
@@ -173,20 +176,50 @@ func (dr *DynamicRewrite) buildNewPath(req *http.Request, dynamicIdentifier stri
 	return newPath, basePath
 }
 
-// fallbackEligible limits the fallback to page navigations: a request for a
-// file (a last path segment with an extension) keeps the backend's status, so
-// a missing asset stays a 404 instead of turning into the HTML page.
+// fallbackEligible limits the fallback to page navigations, so a missing
+// asset or API call keeps the backend's status instead of getting the HTML
+// page. Browsers say so directly with Sec-Fetch-Mode; without it, a request
+// counts as a navigation when it asks for HTML, or when it names no file and
+// accepts anything.
 func (dr *DynamicRewrite) fallbackEligible(req *http.Request, originalPath string) bool {
-	if dr.fallbackPathComponent == "" || req.Header.Get(FallbackURLHeader) != "" {
+	if dr.fallbackPathComponent == "" {
 		return false
 	}
 	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		return false
 	}
-	if strings.Contains(req.Header.Get("Accept"), "text/html") {
+	if mode := req.Header.Get("Sec-Fetch-Mode"); mode != "" {
+		return mode == "navigate"
+	}
+	accept := req.Header.Get("Accept")
+	if acceptsMediaType(accept, "text/html") || acceptsMediaType(accept, "application/xhtml+xml") {
 		return true
 	}
-	return !strings.Contains(path.Base(originalPath), ".")
+	namesFile := strings.Contains(path.Base(originalPath), ".")
+	return !namesFile && (accept == "" || acceptsMediaType(accept, "*/*"))
+}
+
+// acceptsMediaType reports whether an Accept header lists the media type with
+// a non-zero quality.
+func acceptsMediaType(accept string, mediaType string) bool {
+	for _, entry := range strings.Split(accept, ",") {
+		fields := strings.Split(entry, ";")
+		if strings.TrimSpace(fields[0]) != mediaType {
+			continue
+		}
+		accepted := true
+		for _, param := range fields[1:] {
+			name, value, found := strings.Cut(strings.TrimSpace(param), "=")
+			if found && strings.TrimSpace(name) == "q" {
+				value = strings.TrimSpace(value)
+				accepted = value != "0" && value != "0.0" && value != "0.00" && value != "0.000"
+			}
+		}
+		if accepted {
+			return true
+		}
+	}
+	return false
 }
 
 func (dr *DynamicRewrite) isFallbackStatus(status int) bool {
@@ -233,11 +266,23 @@ type interceptingWriter struct {
 }
 
 func (w *interceptingWriter) Header() http.Header {
+	if w.wroteHeader && !w.intercepted {
+		// Passed through: trailers set after the body must reach the real writer.
+		return w.rw.Header()
+	}
 	return w.header
 }
 
 func (w *interceptingWriter) WriteHeader(status int) {
 	if w.wroteHeader {
+		return
+	}
+	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
+		// Informational responses (e.g. 103 Early Hints) pass through and are
+		// not the final status.
+		w.copyHeader()
+		w.rw.WriteHeader(status)
+		w.header = http.Header{}
 		return
 	}
 	w.wroteHeader = true
@@ -246,11 +291,15 @@ func (w *interceptingWriter) WriteHeader(status int) {
 		w.intercepted = true
 		return
 	}
+	w.copyHeader()
+	w.rw.WriteHeader(status)
+}
+
+func (w *interceptingWriter) copyHeader() {
 	target := w.rw.Header()
 	for key, values := range w.header {
 		target[key] = values
 	}
-	w.rw.WriteHeader(status)
 }
 
 func (w *interceptingWriter) Write(body []byte) (int, error) {
