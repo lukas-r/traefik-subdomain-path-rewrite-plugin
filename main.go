@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 
 	logger "github.com/lukas-r/traefik-subdomain-path-rewrite-plugin/pkg/logger"
@@ -188,6 +189,11 @@ func (dr *DynamicRewrite) fallbackEligible(req *http.Request, originalPath strin
 	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		return false
 	}
+	if req.Header.Get("Upgrade") != "" {
+		// Protocol upgrades need the writer's Hijacker, which the fallback
+		// wrapper does not provide.
+		return false
+	}
 	if mode := req.Header.Get("Sec-Fetch-Mode"); mode != "" {
 		return mode == "navigate"
 	}
@@ -204,15 +210,15 @@ func (dr *DynamicRewrite) fallbackEligible(req *http.Request, originalPath strin
 func acceptsMediaType(accept string, mediaType string) bool {
 	for _, entry := range strings.Split(accept, ",") {
 		fields := strings.Split(entry, ";")
-		if strings.TrimSpace(fields[0]) != mediaType {
+		if !strings.EqualFold(strings.TrimSpace(fields[0]), mediaType) {
 			continue
 		}
 		accepted := true
 		for _, param := range fields[1:] {
 			name, value, found := strings.Cut(strings.TrimSpace(param), "=")
-			if found && strings.TrimSpace(name) == "q" {
-				value = strings.TrimSpace(value)
-				accepted = value != "0" && value != "0.0" && value != "0.00" && value != "0.000"
+			if found && strings.EqualFold(strings.TrimSpace(name), "q") {
+				quality, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+				accepted = err == nil && quality > 0
 			}
 		}
 		if accepted {
@@ -279,10 +285,13 @@ func (w *interceptingWriter) WriteHeader(status int) {
 	}
 	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
 		// Informational responses (e.g. 103 Early Hints) pass through and are
-		// not the final status.
+		// not the final status; their headers must not carry over into it.
 		w.copyHeader()
 		w.rw.WriteHeader(status)
-		w.header = http.Header{}
+		target := w.rw.Header()
+		for key := range target {
+			delete(target, key)
+		}
 		return
 	}
 	w.wroteHeader = true

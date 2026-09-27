@@ -102,7 +102,7 @@ The fallback is served in place of the backend's response only when all of these
   - with browser fetch metadata: `Sec-Fetch-Mode: navigate`;
   - without it: `Accept` lists `text/html` or `application/xhtml+xml` (with a non-zero quality), or the last path segment has no file extension and `Accept` is empty or accepts `*/*`.
 
-A request for a file that does not exist (`/assets/missing.js`) or an API call (`Accept: application/json`) keeps the backend's status, so a broken build shows up as a 404 instead of an HTML page. The fallback request is dispatched to the same backend inside Traefik, so the fallback document does not need a publicly resolvable host.
+A request for a file that does not exist (`/assets/missing.js`), an API call that accepts only JSON (`Accept: application/json`), or a protocol upgrade (WebSocket) keeps the backend's status, so a broken build shows up as a 404 instead of an HTML page. The fallback request is dispatched to the same backend inside Traefik, so the fallback document does not need a publicly resolvable host.
 
 ##### fallbackStatusCodes
 
@@ -146,7 +146,7 @@ Based on the example configuration above, here's how different URLs would be rew
 
 ## Headers
 
-The plugin sets these headers on the request it forwards. Values a client sends for them are removed first, so they cannot be used to skip the rewrite:
+The plugin sets these headers on the request it forwards. Values a client sends for them are removed first, so they cannot be used to skip the rewrite. Because of that, a second instance of this middleware on the same router rewrites again; use one instance per router:
 
 - `X-Replaced-Path`: Original path before rewriting
 - `X-Replaced-Host`: Original host before rewriting

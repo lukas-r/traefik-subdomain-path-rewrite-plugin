@@ -376,3 +376,59 @@ func TestOnlyNavigationsFallBack(t *testing.T) {
 		}
 	}
 }
+
+func TestEarlyHintHeadersDoNotLeakIntoTheFinalResponse(t *testing.T) {
+	backend := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Link", "</a.js>; rel=preload")
+		rw.WriteHeader(http.StatusEarlyHints)
+		// httputil.ReverseProxy, as used by Traefik, clears the header map it
+		// got from Header() after forwarding each 1xx.
+		for key := range rw.Header() {
+			delete(rw.Header(), key)
+		}
+		rw.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(rw, "final")
+	})
+	server := httptest.NewServer(newPluginFor(t, backend, nil))
+	defer server.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/page", nil)
+	req.Host = previewHost
+	transport := &http.Transport{}
+	defer transport.CloseIdleConnections()
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Link") != "" {
+		t.Fatalf("got %d, Link=%q on the final response", resp.StatusCode, resp.Header.Get("Link"))
+	}
+}
+
+func TestUpgradeRequestsAndAcceptEdgeCases(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		headers      map[string]string
+		wantFallback bool
+	}{
+		{"websocket upgrade", map[string]string{"Upgrade": "websocket", "Connection": "Upgrade"}, false},
+		{"uppercase media type", map[string]string{"Accept": "TEXT/HTML"}, true},
+		{"uppercase zero quality", map[string]string{"Accept": "text/html;Q=0, application/json"}, false},
+		{"trailing-dot zero quality", map[string]string{"Accept": "text/html;q=0., application/json"}, false},
+		{"small positive quality", map[string]string{"Accept": "text/html;q=0.001"}, true},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "http://"+previewHost+"/employees", nil)
+		req.Host = previewHost
+		for k, v := range tc.headers {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		newPlugin(t, website(http.StatusNotFound), nil).ServeHTTP(rec, req)
+		gotFallback := rec.Code == http.StatusOK && rec.Body.String() == "<html>preview 2636</html>"
+		if gotFallback != tc.wantFallback {
+			t.Fatalf("%s: fallback=%v, got %d", tc.name, gotFallback, rec.Code)
+		}
+	}
+}
