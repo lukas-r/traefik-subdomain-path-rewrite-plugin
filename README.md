@@ -8,7 +8,8 @@ This plugin for Traefik enables dynamic path rewriting based on subdomains and p
 - Optional path preservation after rewriting
 - Configurable base path for all rewrites
 - Custom host replacement
-- Fallback path handling for 404 responses
+- Fallback document for page navigations the backend cannot answer (single-page apps)
+- Responses stream through; only a response that is replaced by the fallback is held back
 - Detailed request tracking through custom headers
 
 ## Configuration
@@ -22,7 +23,7 @@ experimental:
   plugins:
     subdomainPathRewrite:
       moduleName: "github.com/lukas-r/traefik-subdomain-path-rewrite-plugin"
-      version: "v0.3.1"
+      version: "v0.4.0"
 ```
 
 ### Dynamic Configuration
@@ -37,7 +38,8 @@ Dynamic configuration can be modified at runtime and controls the plugin's behav
 | replacementHost | string | "" | Override the target host. If empty, uses the base domain |
 | basePath | string | "" | Base path prefix for all rewritten URLs |
 | keepPath | bool | true | Preserve the original path after the rewritten portion |
-| fallbackPath | string | "" | Path to try when original request returns 404 |
+| fallbackPath | string | "" | Document to serve when a page navigation gets a fallback status |
+| fallbackStatusCodes | []int | [404] | Backend statuses that trigger the fallback |
 | logLevel | string | "INFO" | Logging level (INFO, DEBUG, ERROR) |
 
 #### Detailed Parameter Behavior
@@ -90,9 +92,24 @@ The fallbackPath parameter has two distinct behaviors based on whether it starts
      - Original: `customer.example.com/products/not-found`
      - Fallback: `example.com/api/customer/products/default`
 
+##### Which requests fall back
+
+The fallback is served in place of the backend's response only when all of these hold:
+
+- the backend answered with one of `fallbackStatusCodes`;
+- the request is `GET` or `HEAD`;
+- it is a page navigation: its last path segment has no file extension (`/employees/42`), or its `Accept` header contains `text/html`.
+
+A request for a file that does not exist (`/assets/missing.js`) keeps the backend's status, so a broken build shows up as a 404 instead of an HTML page. The fallback request is dispatched to the same backend inside Traefik, so the fallback document does not need a publicly resolvable host.
+
+##### fallbackStatusCodes
+
+- Defaults to `[404]`
+- Add `403` for backends that answer missing keys with Access Denied, for example an S3 bucket without list permission
+
 ##### logLevel
 
-- "INFO": Standard operational logging
+- "INFO": Standard operational logging (per-request details are DEBUG only)
 - "DEBUG": Detailed request/response information
 - "ERROR": Only error conditions
 - Affects the verbosity of plugin logs
@@ -121,8 +138,9 @@ Based on the example configuration above, here's how different URLs would be rew
 | `customer1.example.com/users` | `example.com/api/customer1/users` | Subdomain becomes path segment |
 | `customer2.example.com/` | `example.com/api/customer2/` | Minimal path case |
 | `customer3.example.com/orders/123` | `example.com/api/customer3/orders/123` | Complex path preservation |
-| `customer4.example.com/products/not-found` | `example.com/api/customer4/default` | Absolute fallback path (`/default`) |
-| `customer5.example.com/catalog/missing` | `example.com/api/customer5/catalog/default` | Relative fallback path (`default`) |
+| `customer4.example.com/products/not-found` | `example.com/api/customer4/default` | Absolute fallback path (`/default`), page navigation |
+| `customer5.example.com/catalog/missing` | `example.com/api/customer5/catalog/default` | Relative fallback path (`default`), page navigation |
+| `customer6.example.com/assets/missing.js` | `example.com/api/customer6/assets/missing.js` | File request: no fallback, the 404 is returned |
 
 ## Headers
 
@@ -130,6 +148,17 @@ The plugin adds several headers to track the rewriting process:
 
 - `X-Replaced-Path`: Original path before rewriting
 - `X-Replaced-Host`: Original host before rewriting
-- `X-Fallback-For`: Original URL when serving fallback content
+- `X-Fallback-For`: The rewritten path the fallback replaces (set on the fallback request to the backend)
 
 These headers are useful for debugging and understanding how requests are being transformed by the plugin.
+
+## Development
+
+Traefik runs plugins in the [Yaegi](https://github.com/traefik/yaegi) interpreter, so run the tests under both Go and Yaegi:
+
+```bash
+go test ./...
+yaegi test -v .
+```
+
+Under Yaegi, a response writer the plugin hands to Traefik is wrapped without `http.Flusher`, so explicit flushes from the backend are not propagated. Writes still pass straight through and are sent as the server's write buffer fills.
