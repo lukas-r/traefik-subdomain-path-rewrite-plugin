@@ -111,8 +111,6 @@ func (dr *DynamicRewrite) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// in place cannot leak into the fallback request.
 	fallbackReq := dr.buildFallbackRequest(req, internalBasePath)
 
-	// Normal responses stream straight through; only a fallback status is held
-	// back so the fallback document can be served in its place.
 	intercept := &interceptingWriter{rw: rw, header: http.Header{}, shouldIntercept: dr.isFallbackStatus}
 	dr.next.ServeHTTP(intercept, req)
 	if !intercept.intercepted {
